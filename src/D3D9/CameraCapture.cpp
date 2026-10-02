@@ -2,6 +2,129 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <windows.h>
+#include <sstream>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <initializer_list>
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC PROBE (temporary): appends short lines to ModernWoWProbe.log in
+// the folder containing the game .exe. Every distinct
+// message is written once, and each tag is capped, so the file stays small.
+// This changes no rendering behaviour.
+// ---------------------------------------------------------------------------
+namespace
+{
+    std::string ProbeLogPath()
+    {
+        char exe[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string p(exe, (n > 0 && n < MAX_PATH) ? n : 0);
+        size_t slash = p.find_last_of("\\/");
+        if (slash == std::string::npos)
+            return "ModernWoWProbe.log";
+        return p.substr(0, slash + 1) + "ModernWoWProbe.log";
+    }
+
+    void ProbeLog(const char* tag, const std::string& message, int maxPerTag)
+    {
+        static std::mutex lock;
+        static std::map<std::string, int> counts;
+        static std::set<std::string> seen;
+        std::lock_guard<std::mutex> guard(lock);
+        const std::string key = std::string(tag) + "|" + message;
+        if (seen.count(key))
+            return;
+        int& n = counts[tag];
+        if (n >= maxPerTag)
+            return;
+        seen.insert(key);
+        ++n;
+
+        // Write next to the game .exe (not the "current directory", which can
+        // differ depending on how the game was launched). If that folder is not
+        // writable, fall back to the Windows temp folder.
+        static const std::string exeDirLog = ProbeLogPath();
+        static bool started = false;
+        std::ofstream out(exeDirLog, std::ios::app);
+        std::string usedPath = exeDirLog;
+        if (!out)
+        {
+            char tmp[MAX_PATH] = {};
+            DWORD t = GetTempPathA(MAX_PATH, tmp);
+            if (t > 0 && t < MAX_PATH)
+            {
+                usedPath = std::string(tmp) + "ModernWoWProbe.log";
+                out.clear();
+                out.open(usedPath, std::ios::app);
+            }
+        }
+        if (out)
+        {
+            if (!started)
+            {
+                started = true;
+                out << "=== probe log started; writing to: " << usedPath << "\n";
+            }
+            out << "[" << tag << " #" << n << "] " << message << "\n";
+        }
+    }
+}
+
+namespace
+{
+    std::string RowsStr(const float (*v)[4], std::initializer_list<int> rows)
+    {
+        std::ostringstream s;
+        for (int r : rows)
+            s << "\n    c" << r << " = " << v[r][0] << ", " << v[r][1] << ", " << v[r][2] << ", " << v[r][3];
+        return s.str();
+    }
+
+    std::string HashStr(uint64_t h)
+    {
+        std::ostringstream s;
+        s << "0x" << std::hex << h;
+        return s.str();
+    }
+
+    std::string BuildIniPath()
+    {
+        char exe[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string p(exe, (n > 0 && n < MAX_PATH) ? n : 0);
+        size_t slash = p.find_last_of("\\/");
+        if (slash == std::string::npos)
+            return "GraphicsEffects.ini";
+        return p.substr(0, slash + 1) + "GraphicsEffects.ini";
+    }
+
+    // Which sign convention to use for the sun/moon direction constant (c24).
+    // Set  SunDirectionMode=N  under [Atmosphere] in GraphicsEffects.ini
+    // (re-read every ~1 second, no restart needed):
+    //   0 = (-x, -y, +z)  original setting from the mod's author
+    //   1 = (-x, -y, -z)  exact opposite of c24 (points at the anti-sun on this client)
+    //   2 = (+x, +y, +z)  c24 points TOWARD the sun (correct here)   <- default
+    //   3 = (+x, +y, -z)
+    int GetSunDirectionMode()
+    {
+        static const std::string iniPath = BuildIniPath();
+        static int cached = 2;
+        static unsigned counter = 0;
+        if ((counter++ % 60) == 0)
+        {
+            int m = static_cast<int>(GetPrivateProfileIntA("Atmosphere", "SunDirectionMode", 2, iniPath.c_str()));
+            if (m < 0 || m > 3)
+                m = 2;
+            cached = m;
+        }
+        return cached;
+    }
+}
 
 namespace renderer
 {
@@ -25,23 +148,43 @@ namespace renderer
 
         m_cameraCaptureShaderHash = shaderHash;
 
+        ProbeLog("capture-called", "Capture() reached from shader hash " + HashStr(shaderHash), 40);
+
         float v[27][4]{};
         D3DVIEWPORT9 vp{};
 
-        if (FAILED(device->GetVertexShaderConstantF(0, v[0], 27)) ||
-            FAILED(device->GetViewport(&vp)) ||
+        HRESULT hrConst = device->GetVertexShaderConstantF(0, v[0], 27);
+        HRESULT hrView = device->GetViewport(&vp);
+        if (FAILED(hrConst) || FAILED(hrView) ||
             vp.MinZ != 0.0f || vp.MaxZ <= 0.0f)
+        {
+            std::ostringstream s;
+            s << "constants/viewport rejected: GetVertexShaderConstantF hr=0x" << std::hex
+              << static_cast<unsigned long>(hrConst) << " GetViewport hr=0x"
+              << static_cast<unsigned long>(hrView) << std::dec
+              << " vp.MinZ=" << vp.MinZ << " vp.MaxZ=" << vp.MaxZ;
+            ProbeLog("capture-rejected-viewport", s.str(), 5);
             return false;
+        }
 
         for (auto& row : v)
             for (float f : row)
                 if (!std::isfinite(f))
+                {
+                    ProbeLog("capture-rejected-nonfinite",
+                        "non-finite constant, shader " + HashStr(shaderHash), 3);
                     return false;
+                }
 
         // Verify standard WoW perspective projection and rigid world-view
         if (v[4][0] <= 0.0f || v[5][1] <= 0.0f || v[6][2] <= 1.0f || v[7][2] >= 0.0f ||
             fabsf(v[6][3] - 1.0f) > 0.001f || fabsf(v[7][3]) > 0.001f)
+        {
+            ProbeLog("capture-rejected-projection",
+                "Projection layout check FAILED for shader " + HashStr(shaderHash) +
+                ". Constants seen:" + RowsStr(v, {0,1,2,3,4,5,6,7,24,25,26}), 12);
             return false;
+        }
 
         // Verify orthogonality of rotation sub-matrix (v[0..2])
         for (int i = 0; i < 3; ++i)
@@ -52,7 +195,14 @@ namespace renderer
                 for (int k = 0; k < 3; ++k)
                     dot += v[i][k] * v[j][k];
                 if (fabsf(dot - (i == j ? 1.0f : 0.0f)) > 0.002f)
+                {
+                    std::ostringstream s;
+                    s << "Rotation orthogonality check FAILED for shader " << HashStr(shaderHash)
+                      << " (row " << i << " . row " << j << " = " << dot << "). Constants seen:"
+                      << RowsStr(v, {0,1,2,3,4,5,6,7,24,25,26});
+                    ProbeLog("capture-rejected-rotation", s.str(), 12);
                     return false;
+                }
             }
         }
 
@@ -99,14 +249,19 @@ namespace renderer
         outConstants[2][3] = vp.MaxZ;
 
         float lightLen = std::sqrt(v[24][0] * v[24][0] + v[24][1] * v[24][1] + v[24][2] * v[24][2]);
+        const int sunMode = GetSunDirectionMode();
         if (lightLen > 1e-4f)
         {
             // View-space light vector points towards celestial body:
             // In WoW, v[24] is light propagation (towards camera/down).
             // Facing the sun/moon is in direction (-v[24][0], -v[24][1], +v[24][2]).
-            float lx = -v[24][0] / lightLen;
-            float ly = -v[24][1] / lightLen;
-            float lz =  v[24][2] / lightLen;
+            // The sign convention of c24 differs between clients. See
+            // GetSunDirectionMode() above; it is chosen from GraphicsEffects.ini.
+            const float signXY = (sunMode & 2) ? 1.0f : -1.0f;
+            const float signZ  = (sunMode == 1 || sunMode == 3) ? -1.0f : 1.0f;
+            float lx = signXY * v[24][0] / lightLen;
+            float ly = signXY * v[24][1] / lightLen;
+            float lz = signZ  * v[24][2] / lightLen;
             outConstants[10][0] = lx;
             outConstants[10][1] = ly;
             outConstants[10][2] = lz;
@@ -256,8 +411,49 @@ namespace renderer
         sunWorld.x /= swLen; sunWorld.y /= swLen; sunWorld.z /= swLen;
         frameContext.sunDirectionWorld = sunWorld;
 
+        // DIAGNOSTIC: periodic snapshot of everything that decides whether sun
+        // shafts get drawn (light constants, computed sun position, strength).
+        if (m_capturedFrames % 120 == 0)
+        {
+            std::ostringstream s;
+            s << "shader " << HashStr(shaderHash)
+              << "\n    c24 (light dir)   = " << v[24][0] << ", " << v[24][1] << ", " << v[24][2] << ", " << v[24][3]
+              << "\n    c25               = " << v[25][0] << ", " << v[25][1] << ", " << v[25][2] << ", " << v[25][3]
+              << "\n    c26 (light color) = " << v[26][0] << ", " << v[26][1] << ", " << v[26][2] << ", " << v[26][3]
+              << "\n    lightLen=" << lightLen << " directLuminance=" << directLuminance
+              << " daylight=" << daylight << " moonlight=" << moonlight
+              << "\n    sunDirView=" << frameContext.sunDirectionView.x << ", "
+              << frameContext.sunDirectionView.y << ", " << frameContext.sunDirectionView.z
+              << "\n    sunScreen=" << frameContext.sunScreenX << ", " << frameContext.sunScreenY
+              << " sunStrength=" << frameContext.sunStrength
+              << "\n    config: strength=" << config.strength << " moonStrength=" << config.moonStrength
+              << " sunOffset=" << config.sunOffsetX << "," << config.sunOffsetY
+              << " sunVerticalScale=" << config.sunVerticalScale
+              << " shaftDebug=" << config.shaftDebug
+              << "\n    SunDirectionMode in use = " << sunMode;
+            if (lightLen > 1e-4f)
+            {
+                // With the right mode, this world-space direction stays the same
+                // while the camera turns, and points UP (z > 0) in daytime.
+                for (int m = 0; m < 4; ++m)
+                {
+                    const float mxy = (m & 2) ? 1.0f : -1.0f;
+                    const float mz  = (m == 1 || m == 3) ? -1.0f : 1.0f;
+                    const float ax = mxy * v[24][0] / lightLen;
+                    const float ay = mxy * v[24][1] / lightLen;
+                    const float az = mz  * v[24][2] / lightLen;
+                    s << "\n    mode " << m << " world sun dir = "
+                      << (v[0][0] * ax + v[0][1] * ay + v[0][2] * az) << ", "
+                      << (v[1][0] * ax + v[1][1] * ay + v[1][2] * az) << ", "
+                      << (v[2][0] * ax + v[2][1] * ay + v[2][2] * az);
+                }
+            }
+            ProbeLog("sun-sample", s.str(), 30);
+        }
+
         m_valid = true;
         ++m_capturedFrames;
+        ProbeLog("camera-ok", "First successful camera capture, shader " + HashStr(shaderHash), 1);
         return true;
     }
 }
