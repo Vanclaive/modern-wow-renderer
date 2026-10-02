@@ -7,7 +7,9 @@ inline std::wstring baseFile, localFile;
 inline LocationContext active;
 inline bool editable=false;
 inline bool editZone=false;
-inline bool IsGlobal(LPCWSTR section) { return section && _wcsicmp(section,L"PostProcess")==0; }
+// WOTLK-COMPAT: when the client location cannot be verified (editable==false), treat every section as global so the
+// overlay edits the base GraphicsEffects.ini instead of going read-only. No change when location is verified.
+inline bool IsGlobal(LPCWSTR section) { return section && (_wcsicmp(section,L"PostProcess")==0 || !editable); }
 inline std::wstring Scope(unsigned level) {
     std::wstring result=L"Map."+std::to_wstring(active.mapId);
     if(level>=1)result+=L".Zone."+std::to_wstring(active.zoneId);
