@@ -1,45 +1,13 @@
 # Modern WoW Renderer
 
-Modern WoW Renderer is a 32-bit Direct3D 9 proxy (`d3d9.dll`) that adds modern lighting, atmosphere, water, weather, and post-processing effects to the World of Warcraft client used by [Project Ascension](https://ascension.gg/).
+Modern WoW Renderer is a 32-bit Direct3D 9 proxy (`d3d9.dll`) that adds modern lighting, atmosphere, water, weather, and post-processing effects to the World of Warcraft.  Outside of kludging it to function with stock 3.3.5, this is all Corfirean's work.  This fork was crafted with Corfirean's consent and encouragement.  All credit to them!
 
 > [!IMPORTANT]
-> This project is developed and tested for the **Ascension client**. It is **not tested with a stock World of Warcraft 3.3.5 client**. The renderer is under active development, so visual glitches, compatibility problems, crashes, and performance regressions may still occur.
+> This fork was designed to work with a stock **World of Warcraft (3.3.5) client**. It is **not tested with the Ascension client**. The renderer is under active development, so visual glitches, compatibility problems, crashes, and performance regressions may still occur.
 
 > [!WARNING]
 > **AI Materials are not implemented as a supported feature yet.** The repository contains experimental material-cache code and configuration placeholders, but they are incomplete, disabled by default, and should not be treated as part of the current release.
 
-## Screenshots
-
-<table>
-  <tr>
-    <td><img src="Screenshots/WoWScrnShot_092826_215004.jpg" alt="Rain, fog and local lighting" /></td>
-    <td><img src="Screenshots/WoWScrnShot_092826_215807.jpg" alt="Volumetric fog around a lantern" /></td>
-  </tr>
-  <tr>
-    <td><img src="Screenshots/WoWScrnShot_092826_220551.jpg" alt="Local fire lighting and fog" /></td>
-    <td><img src="Screenshots/WoWScrnShot_092826_222851.jpg" alt="Rain and volumetric lighting in a forest" /></td>
-  </tr>
-  <tr>
-    <td><img src="Screenshots/WoWScrnShot_092626_222609.jpg" alt="Water and atmospheric lighting" /></td>
-    <td><img src="Screenshots/WoWScrnShot_092626_232041.jpg" alt="Water reflections at night" /></td>
-  </tr>
-  <tr>
-    <td><img src="Screenshots/WoWScrnShot_092626_232124.jpg" alt="Water rendering and distant atmosphere" /></td>
-    <td><img src="Screenshots/WoWScrnShot_092626_232814.jpg" alt="Rain in Stormwind" /></td>
-  </tr>
-  <tr>
-    <td><img src="Screenshots/WoWScrnShot_092726_000028.jpg" alt="Night reflections in Stormwind" /></td>
-    <td><img src="Screenshots/WoWScrnShot_092726_000456.jpg" alt="Coastal water and ship" /></td>
-  </tr>
-  <tr>
-    <td><img src="Screenshots/WoWScrnShot_092726_000647.jpg" alt="Night sky and environment lighting" /></td>
-    <td><img src="Screenshots/WoWScrnShot_092726_000749.jpg" alt="Red environment lighting" /></td>
-  </tr>
-  <tr>
-    <td><img src="Screenshots/f7-location-settings.png" alt="Compact F7 menu with zone and subarea preset selection" /></td>
-    <td></td>
-  </tr>
-</table>
 
 ## Current features
 
@@ -110,7 +78,7 @@ Location presets require an exact verified executable fingerprint and an authori
 Example layout:
 
 ```text
-Ascension/
+World of Warcraft/
 ├── d3d9.dll
 ├── ModernWoWRenderer.ini
 ├── GraphicsEffects.ini
@@ -211,7 +179,7 @@ The proxy loads the system Direct3D 9 runtime, forwards the normal API, observes
 
 Open a GitHub issue with:
 
-- the Ascension client build and zone;
+- the World of Warcraft - Wrath of the Lich King client build and zone;
 - the effect and settings involved;
 - exact reproduction steps, including whether Alt+Tab, F7, a mount, or a device reset is involved;
 - `ModernWoWRenderer.log` and a screenshot or short video when available.
