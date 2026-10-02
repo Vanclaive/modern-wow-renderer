@@ -426,7 +426,8 @@ struct Scope {
                 D3DSURFACE_DESC desc{};
                 if(FAILED(static_cast<IDirect3DTexture9*>(tex.Get())->GetLevelDesc(0,&desc)))return;
                 if(slot==0&&(desc.Width!=8||desc.Height!=64))return;
-                if(slot==1&&(desc.Width!=512||desc.Height!=512))return;
+                // Slot 1 is 512x512 on Ascension but 256x256 on the 3.3.5 client; accept both.
+                if(slot==1&&!((desc.Width==512&&desc.Height==512)||(desc.Width==256&&desc.Height==256)))return;
             }
             original = renderer::g_trackedState.currentPS;
             originalVertex = renderer::g_trackedState.currentVS;

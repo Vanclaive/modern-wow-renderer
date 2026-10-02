@@ -4,6 +4,8 @@
 #include <d3d9.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include "src/Environment/OverlayFont.h"
@@ -15,6 +17,16 @@ struct Item { ItemKind kind; const wchar_t* section; const wchar_t* key; const c
 inline std::wstring ini;
 inline bool visible=false,f7Down=false,mouseDown=false;
 inline int hover=-1,dragItem=-1;
+// WOTLK-COMPAT: input state (see the "WOTLK-COMPAT input handling" block above Update()).
+enum ControlZone { CZ_NONE, CZ_TOGGLE, CZ_TRACK, CZ_VALUE };
+inline bool inputHookEnabled=true,hookActive=false,hookUnicode=true,panelPress=false,pendingApply=false,forceApply=false,dragFine=false;
+inline std::vector<char> dirty;
+inline ULONGLONG lastApply=0;
+inline float dragAnchorX=0.f,dragAnchorT=0.f;
+inline int entryItem=-1,wheelSteps=0,wheelAccum=0;
+inline std::string entryText;
+inline HWND gameWindow=nullptr;
+inline WNDPROC prevProc=nullptr;
 inline std::vector<Item> items={
  // === ATMOSPHERE & GOD RAYS ===
  {KIND_HEADER,nullptr,nullptr,"--- ATMOSPHERE & GOD RAYS ---",0,0,0,0},
@@ -105,7 +117,7 @@ inline std::vector<Item> items={
  {KIND_SLIDER,L"PostProcess",L"SharpnessPercent","SHARPNESS",0,100,2,35}
 };
 inline const std::vector<int> defaults=[](){std::vector<int> result;for(const auto& i:items)result.push_back(i.value);return result;}();
-inline void Configure(const std::wstring& base){ini=base+L"GraphicsEffects.ini";for(auto& i:items){if(i.kind==KIND_HEADER)continue;i.value=std::clamp(static_cast<int>(renderer::locationtuning::ReadEditorInt(i.section,i.key,defaults[&i-items.data()],ini.c_str())),i.lo,i.hi);}}
+inline void Configure(const std::wstring& base){ini=base+L"GraphicsEffects.ini";inputHookEnabled=GetPrivateProfileIntW(L"Overlay",L"InputHook",1,ini.c_str())!=0;for(auto& i:items){if(i.kind==KIND_HEADER)continue;i.value=std::clamp(static_cast<int>(renderer::locationtuning::ReadEditorInt(i.section,i.key,defaults[&i-items.data()],ini.c_str())),i.lo,i.hi);}}
 inline void Save(Item& i){if(i.kind==KIND_HEADER)return;renderer::locationtuning::Save(i.section,i.key,i.value);}
 inline const std::array<unsigned char,7>& Glyph(char c){
  if(c>='a'&&c<='z')c=char(c-'a'+'A');
@@ -192,36 +204,189 @@ inline bool SelectScope(int scope){
  for(auto& i:items)if(i.kind!=KIND_HEADER)i.value=std::clamp(static_cast<int>(renderer::locationtuning::ReadEditorInt(i.section,i.key,defaults[&i-items.data()],ini.c_str())),i.lo,i.hi);
  return true;
 }
+// =====================================================================
+// WOTLK-COMPAT input handling (everything between here and Draw()).
+//  - Only the bar itself drags; clicking a label or empty row space does nothing.
+//  - Values are shown instantly, but the ini write + module reload is throttled
+//    to ~8/second while dragging (and always runs once on release).
+//  - Hold SHIFT while dragging for fine control. Mouse wheel = one step (CTRL = 5).
+//  - Click a number to type a value (Enter = apply, Esc = cancel).
+//  - A small window hook keeps panel clicks / wheel / typed keys away from the
+//    game (no camera turning while dragging, no action-bar keys while typing).
+//    Disable with   [Overlay]  InputHook=0   in GraphicsEffects.ini.
+// =====================================================================
+inline void MapClient(HWND window,POINT client,float& px,float& py){
+ px=float(client.x);py=float(client.y);
+ RECT rc{};
+ if(!window||!GetClientRect(window,&rc))return;
+ if(renderWidth&&renderHeight&&rc.right>0&&rc.bottom>0){px=float(client.x)*renderWidth/rc.right;py=float(client.y)*renderHeight/rc.bottom;}
+}
+inline bool PanelContains(float px,float py){return px>=PanelX()&&px<PanelX()+columns*columnWidth*uiScale&&py>=PanelY()&&py<PanelY()+panelHeight;}
+inline bool CanEdit(int index){return index>=0&&(renderer::locationtuning::editable||renderer::locationtuning::IsGlobal(items[size_t(index)].section));}
+inline ControlZone ItemZone(int index,float px){
+ if(index<0)return CZ_NONE;
+ const Item& it=items[size_t(index)];
+ if(it.kind==KIND_TOGGLE)return CZ_TOGGLE;
+ if(it.kind!=KIND_SLIDER)return CZ_NONE;
+ const float local=(px-(PanelX()+ItemColumn(index)*columnWidth*uiScale))/uiScale;
+ if(local>=248.f&&local<=338.f)return CZ_TRACK;
+ if(local>=206.f&&local<248.f)return CZ_VALUE;
+ return CZ_NONE;
+}
+inline void MarkDirty(int idx){
+ if(dirty.size()!=items.size())dirty.assign(items.size(),0);
+ dirty[size_t(idx)]=1;pendingApply=true;
+}
+inline void SetValue(int idx,int v){
+ Item& i=items[size_t(idx)];
+ v=std::clamp(v,i.lo,i.hi);
+ if(v!=i.value){i.value=v;MarkDirty(idx);}
+}
+inline int ValueAtT(const Item& i,float t){
+ const int steps=int(std::lround(float(i.hi-i.lo)*t/float(std::max(1,i.step))));
+ return std::clamp(i.lo+steps*i.step,i.lo,i.hi);
+}
+// Writes changed values (the caller then reloads every module).
+inline void FlushDirty(){
+ for(size_t k=0;k<dirty.size()&&k<items.size();++k)if(dirty[k]){Save(items[k]);dirty[k]=0;}
+ pendingApply=false;
+}
+inline void CancelEntry(){entryItem=-1;entryText.clear();}
+inline void CommitEntry(){
+ if(entryItem>=0&&entryItem<int(items.size())&&!entryText.empty()&&entryText!="-"){
+  const long v=std::strtol(entryText.c_str(),nullptr,10);
+  SetValue(entryItem,int(std::clamp(v,-100000L,100000L)));
+  forceApply=true;
+ }
+ CancelEntry();
+}
+inline void EntryKey(WPARAM vk){
+ if(entryItem<0)return;
+ const Item& i=items[size_t(entryItem)];
+ if(vk>='0'&&vk<='9'){if(entryText.size()<5)entryText.push_back(char(vk));}
+ else if(vk>=VK_NUMPAD0&&vk<=VK_NUMPAD9){if(entryText.size()<5)entryText.push_back(char('0'+(vk-VK_NUMPAD0)));}
+ else if((vk==VK_OEM_MINUS||vk==VK_SUBTRACT)&&i.lo<0&&entryText.empty())entryText="-";
+ else if(vk==VK_BACK){if(!entryText.empty())entryText.pop_back();}
+ else if(vk==VK_RETURN)CommitEntry();
+ else if(vk==VK_ESCAPE)CancelEntry();
+}
+inline LRESULT CallPrev(HWND h,UINT m,WPARAM w,LPARAM l){
+ if(!prevProc)return hookUnicode?DefWindowProcW(h,m,w,l):DefWindowProcA(h,m,w,l);
+ return hookUnicode?CallWindowProcW(prevProc,h,m,w,l):CallWindowProcA(prevProc,h,m,w,l);
+}
+inline LRESULT CALLBACK HookProc(HWND h,UINT msg,WPARAM w,LPARAM l){
+ if(visible){
+  switch(msg){
+  case WM_LBUTTONDOWN:case WM_LBUTTONDBLCLK:{
+   POINT pt{LONG(short(LOWORD(l))),LONG(short(HIWORD(l)))};float px=0,py=0;MapClient(h,pt,px,py);
+   if(PanelContains(px,py)){panelPress=true;return 0;}
+   break;}
+  case WM_LBUTTONUP:
+   if(panelPress){panelPress=false;return 0;}
+   break;
+  case WM_MOUSEWHEEL:{
+   POINT pt{};GetCursorPos(&pt);ScreenToClient(h,&pt);float px=0,py=0;MapClient(h,pt,px,py);
+   if(PanelContains(px,py)){
+    wheelAccum+=int(GET_WHEEL_DELTA_WPARAM(w));
+    const int st=wheelAccum/WHEEL_DELTA;wheelAccum-=st*WHEEL_DELTA;wheelSteps+=st;
+    return 0;
+   }
+   break;}
+  case WM_KEYDOWN:case WM_SYSKEYDOWN:
+   // Key-UP is deliberately not swallowed, so a key held before typing began can never stick in the game.
+   if(entryItem>=0){if(msg==WM_KEYDOWN)EntryKey(w);return 0;}
+   break;
+  case WM_CHAR:case WM_SYSCHAR:case WM_DEADCHAR:case WM_SYSDEADCHAR:
+   if(entryItem>=0)return 0;
+   break;
+  default:break;
+  }
+ }
+ return CallPrev(h,msg,w,l);
+}
+inline void EnsureHook(){
+ if(!inputHookEnabled||hookActive||!gameWindow)return;
+ hookUnicode=IsWindowUnicode(gameWindow)!=FALSE;
+ const LONG_PTR fn=reinterpret_cast<LONG_PTR>(&HookProc);
+ const LONG_PTR old=hookUnicode?SetWindowLongPtrW(gameWindow,GWLP_WNDPROC,fn):SetWindowLongPtrA(gameWindow,GWLP_WNDPROC,fn);
+ if(old){prevProc=reinterpret_cast<WNDPROC>(old);hookActive=true;}
+}
 inline bool Update(){
  DWORD pid=0;HWND window=GetForegroundWindow();GetWindowThreadProcessId(window,&pid);bool focused=pid==GetCurrentProcessId();
  bool f7=(GetAsyncKeyState(VK_F7)&0x8000)!=0;if(focused&&f7&&!f7Down)visible=!visible;f7Down=f7;
- if(!visible||!focused){hover=-1;dragItem=-1;mouseDown=false;return false;}
+ const bool down=(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0;
+ const ULONGLONG now=GetTickCount64();
+ bool changed=false;
+ if(!visible||!focused){
+  hover=-1;dragItem=-1;panelPress=false;CancelEntry();mouseDown=down;
+  if(pendingApply){FlushDirty();changed=true;}
+  return changed;
+ }
+ EnsureHook();
  RECT client{};GetClientRect(window,&client);
  if(!renderWidth||!renderHeight)Layout(client.right,client.bottom,window);
  POINT p{};GetCursorPos(&p);ScreenToClient(window,&p);
- const float px=renderWidth&&client.right>0?float(p.x)*renderWidth/client.right:float(p.x);
- const float py=renderHeight&&client.bottom>0?float(p.y)*renderHeight/client.bottom:float(p.y);
- bool down=(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0;bool changed=false;
+ float px=0,py=0;MapClient(window,p,px,py);
+ const bool shift=(GetAsyncKeyState(VK_SHIFT)&0x8000)!=0,ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
+ const bool pressed=down&&!mouseDown,released=!down&&mouseDown;
  if(!down)dragItem=-1;
- if(down&&!mouseDown&&HitScope(px,py)>=0){SelectScope(HitScope(px,py));mouseDown=down;return false;}
+ if(pressed&&HitScope(px,py)>=0){
+  if(pendingApply){FlushDirty();changed=true;}   // never carry unsaved edits across a zone/subarea switch
+  CancelEntry();SelectScope(HitScope(px,py));mouseDown=down;return changed;
+ }
  const int curHover=HitItem(px,py);
+ const ControlZone zone=ItemZone(curHover,px);
  hover=dragItem>=0?dragItem:curHover;
- const int editItem=dragItem>=0?dragItem:curHover;
- if(down&&(renderer::locationtuning::editable||(editItem>=0&&renderer::locationtuning::IsGlobal(items[editItem].section)))){
-  if(!mouseDown&&curHover>=0){auto& i=items[curHover];if(i.kind==KIND_TOGGLE){i.value=!i.value;Save(i);changed=true;}else dragItem=curHover;}
-  if(dragItem>=0){
-   auto& i=items[dragItem];const float left=PanelX()+ItemColumn(dragItem)*columnWidth*uiScale;
-   float t=std::clamp((px-left-252*uiScale)/(82*uiScale),0.f,1.f);
-   int value=std::clamp(i.lo+int((i.hi-i.lo)*t/i.step+.5f)*i.step,i.lo,i.hi);
-   if(value!=i.value){i.value=value;Save(i);changed=true;}
+ if(pressed){
+  if(entryItem>=0&&!(curHover==entryItem&&zone==CZ_VALUE))CommitEntry();
+  if(curHover>=0&&CanEdit(curHover)){
+   Item& it=items[size_t(curHover)];
+   if(zone==CZ_TOGGLE){it.value=!it.value;MarkDirty(curHover);forceApply=true;}
+   else if(zone==CZ_TRACK){
+    dragItem=curHover;dragFine=shift;
+    const float left=PanelX()+ItemColumn(curHover)*columnWidth*uiScale+252*uiScale;
+    const float t=std::clamp((px-left)/(82*uiScale),0.f,1.f);
+    dragAnchorX=px;dragAnchorT=t;
+    SetValue(curHover,ValueAtT(it,t));
+   }
+   else if(zone==CZ_VALUE){entryItem=curHover;entryText.clear();}
   }
  }
- mouseDown=down;return changed;
+ if(down&&!pressed&&dragItem>=0&&CanEdit(dragItem)){
+  Item& it=items[size_t(dragItem)];
+  const float trackW=82*uiScale;
+  if(shift!=dragFine){ // re-anchor so switching fine mode never makes the bar jump
+   dragFine=shift;dragAnchorX=px;
+   dragAnchorT=float(it.value-it.lo)/float(std::max(1,it.hi-it.lo));
+  }
+  // Fallback when the hook is off: if the game grabs the cursor (mouselook) it sits
+  // far from the panel; ignore that instead of slamming the bar to min/max.
+  const float trackLeft=PanelX()+ItemColumn(dragItem)*columnWidth*uiScale+252*uiScale;
+  const bool wild=!hookActive&&(px>trackLeft+trackW+250*uiScale||px<trackLeft-250*uiScale);
+  if(!wild){
+   const float gain=dragFine?0.125f:1.f;
+   const float t=std::clamp(dragAnchorT+(px-dragAnchorX)/trackW*gain,0.f,1.f);
+   SetValue(dragItem,ValueAtT(it,t));
+  }
+ }
+ if(wheelSteps!=0){
+  if(curHover>=0&&CanEdit(curHover)&&items[size_t(curHover)].kind==KIND_SLIDER){
+   Item& it=items[size_t(curHover)];
+   SetValue(curHover,it.value+wheelSteps*it.step*(ctrl?5:1));
+  }
+  wheelSteps=0;
+ }
+ mouseDown=down;
+ if(pendingApply&&(forceApply||released||now-lastApply>=120)){
+  FlushDirty();forceApply=false;lastApply=now;changed=true;
+ }
+ if(!pendingApply)forceApply=false;
+ return changed;
 }
 inline void Draw(IDirect3DDevice9* d){
  if(!visible||!d)return;
  IDirect3DStateBlock9* raw=nullptr;if(FAILED(d->CreateStateBlock(D3DSBT_ALL,&raw)))return;if(FAILED(raw->Capture())){raw->Release();return;}
- D3DVIEWPORT9 viewport{};d->GetViewport(&viewport);D3DDEVICE_CREATION_PARAMETERS creation{};d->GetCreationParameters(&creation);
+ D3DVIEWPORT9 viewport{};d->GetViewport(&viewport);D3DDEVICE_CREATION_PARAMETERS creation{};d->GetCreationParameters(&creation);gameWindow=creation.hFocusWindow;
  environmentLines=renderer::EnvironmentProfileManager::Instance().CompactDebugLines();
  renderWidth=int(viewport.Width);renderHeight=int(viewport.Height);
  Layout(viewport.Width,viewport.Height,creation.hFocusWindow);
@@ -230,7 +395,7 @@ inline void Draw(IDirect3DDevice9* d){
  auto label=[&](float xx,float yy,const std::string& text,DWORD color,float right){labels.push_back({xx,yy,right,text,color});};
  Rect(v,x,y,w,panelHeight,0xf5121820);Rect(v,x,y,w,30*uiScale,0xff1b3340);
  label(x+12*uiScale,y+5*uiScale,"Modern WoW Renderer",0xff8effbb,x+w);
- label(x+w-220*uiScale,y+5*uiScale,renderer::locationtuning::editable?"Local preset / F7 close":"Read only / F7 close",0xffb5cbd6,x+w-12*uiScale);
+ label(x+w-220*uiScale,y+5*uiScale,entryItem>=0?"Type a number - Enter OK":(renderer::locationtuning::editable?"Local preset / F7 close":"Global settings / F7 close"),0xffb5cbd6,x+w-12*uiScale);
  for(size_t i=0;i<environmentLines.size();++i)label(x+12*uiScale,y+(36+23*i)*uiScale,environmentLines[i],i?0xffdce5ea:0xffffdc82,x+w-12*uiScale);
  const auto& manager=renderer::EnvironmentProfileManager::Instance();
  const bool zone=renderer::locationtuning::editZone||!renderer::locationtuning::active.areaId;
@@ -239,7 +404,7 @@ inline void Draw(IDirect3DDevice9* d){
  Rect(v,x+595*uiScale,y+132*uiScale,443*uiScale,25*uiScale,!zone?0xff246b47:0xff26343b);
  label(x+162*uiScale,y+135*uiScale,"Entire zone - "+manager.ZoneName(),0xffdce5ea,x+578*uiScale);
  label(x+602*uiScale,y+135*uiScale,renderer::locationtuning::active.areaId?"This subarea - "+manager.AreaName():"Subarea unavailable (Area 0)",0xffdce5ea,x+w-12*uiScale);
- label(x+12*uiScale,y+165*uiScale,"Subarea settings override zone settings.",0xffb5cbd6,x+w-12*uiScale);
+ label(x+12*uiScale,y+165*uiScale,"Subarea settings override zone settings.   Drag a bar (hold SHIFT for fine), use the mouse wheel for single steps, or click a number to type one.",0xffb5cbd6,x+w-12*uiScale);
  for(int column=0;column<columns;++column){
   float xx=x+column*columnWidth*uiScale;
   if(column)Rect(v,xx-2*uiScale,ControlsY(),uiScale,panelHeight-196*uiScale,0xff2a3d48);
@@ -250,7 +415,7 @@ inline void Draw(IDirect3DDevice9* d){
    else{
     label(xx+12*uiScale,yy+3*uiScale,CompactLabel(i),index==hover?0xffffffff:0xffdce5ea,xx+210*uiScale);
     if(i.kind==KIND_TOGGLE){Rect(v,xx+276*uiScale,yy+3*uiScale,58*uiScale,18*uiScale,i.value?0xff246b47:0xff4a3232);label(xx+289*uiScale,yy+3*uiScale,i.value?"ON":"OFF",i.value?0xff9dffc0:0xffffaaaa,xx+340*uiScale);}
-    else{Rect(v,xx+252*uiScale,yy+8*uiScale,82*uiScale,9*uiScale,0xff26343b);float t=float(i.value-i.lo)/float(std::max(1,i.hi-i.lo));Rect(v,xx+252*uiScale,yy+8*uiScale,82*t*uiScale,9*uiScale,0xff45c985);label(xx+212*uiScale,yy+3*uiScale,std::to_string(i.value),0xffffdc82,xx+248*uiScale);}
+    else{Rect(v,xx+252*uiScale,yy+8*uiScale,82*uiScale,9*uiScale,0xff26343b);float t=float(i.value-i.lo)/float(std::max(1,i.hi-i.lo));Rect(v,xx+252*uiScale,yy+8*uiScale,82*t*uiScale,9*uiScale,0xff45c985);if(index==entryItem)Rect(v,xx+208*uiScale,yy+2*uiScale,44*uiScale,20*uiScale,0xff2a5a72);label(xx+212*uiScale,yy+3*uiScale,index==entryItem?entryText+"_":std::to_string(i.value),index==entryItem?0xffffffff:0xffffdc82,xx+(index==entryItem?252:248)*uiScale);}
    }
   }
  }

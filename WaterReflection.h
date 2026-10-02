@@ -30,7 +30,9 @@ inline bool IsWater(IDirect3DDevice9* d){
  D3DSURFACE_DESC d0{},d1{};
  if(FAILED(static_cast<IDirect3DTexture9*>(tex0.Get())->GetLevelDesc(0,&d0))||
     FAILED(static_cast<IDirect3DTexture9*>(tex1.Get())->GetLevelDesc(0,&d1)))return false;
- return d0.Width==8&&d0.Height==64&&d1.Width==512&&d1.Height==512;
+ // Slot 1 is 512x512 on Ascension but 256x256 on the 3.3.5 client; accept both.
+ // Keep this identical to the check in WaterEffect.h.
+ return d0.Width==8&&d0.Height==64&&((d1.Width==512&&d1.Height==512)||(d1.Width==256&&d1.Height==256));
 }
 
 inline void Expose(){
